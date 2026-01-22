@@ -6,6 +6,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import PoseStamped, Point
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_pose
+
 import sensor_msgs_py.point_cloud2 as pc2
 import open3d as o3d
 import numpy as np
@@ -38,6 +43,15 @@ class SmartWiper(Node):
         self.get_logger().info(f"ROI Z: {self.get_parameter('roi_z_min').value} to {self.get_parameter('roi_z_max').value}")
         self.get_logger().info(f"Wiper Angles: {self.get_parameter('wiper_min_angle').value} to {self.get_parameter('wiper_max_angle').value}")
         self.get_logger().info("============================")
+
+        #Nav2 services
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        #Rviz Visualizer
+        self.goal_viz_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
+
         
         # --- 3. Publishers & Services ---
         self.marker_pub = self.create_publisher(MarkerArray, '/scoop_markers', 10)
@@ -80,7 +94,7 @@ class SmartWiper(Node):
         
         # 4. PUBLISH MARKERS
         self.publish_markers(center, start, end)
-        self.publish_nav_goal(start, end)
+        self.send_nav_goal(start, end)
         
         res.success = True
         res.message = "Path Calculated & Cleaned Cloud Published!"
@@ -259,22 +273,51 @@ class SmartWiper(Node):
 
         return final_center, start_pt, end_pt
 
-    def publish_nav_goal(self, start, end):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.pose.position.x = start[0]
-        msg.pose.position.y = start[1]
-        msg.pose.position.z = 0.0 
+
+    def send_nav_goal(self, start, end):
+        # Compute yaw
         dx = end[0] - start[0]
         dy = end[1] - start[1]
         yaw = math.atan2(dy, dx)
+
+        # Pose in base_link
+        pose = PoseStamped()
+        pose.header.frame_id = "base_link"
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = start[0]
+        pose.pose.position.y = start[1]
+        pose.pose.position.z = 0.0
         q = self.quaternion_from_yaw(yaw)
-        msg.pose.orientation.x = q[0]
-        msg.pose.orientation.y = q[1]
-        msg.pose.orientation.z = q[2]
-        msg.pose.orientation.w = q[3]
-        self.goal_pub.publish(msg)
+        pose.pose.orientation.x = q[0]
+        pose.pose.orientation.y = q[1]
+        pose.pose.orientation.z = q[2]
+        pose.pose.orientation.w = q[3]
+
+        # Transform to map frame
+        # 🔹 Transform to map frame
+        tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
+
+        pose_in_map = do_transform_pose(pose.pose, tf)
+
+        pose_map = PoseStamped()
+        pose_map.header.stamp = self.get_clock().now().to_msg()
+        pose_map.header.frame_id = "map"
+        pose_map.pose = pose_in_map
+
+        # 🔹 RViz-only visualization
+        self.goal_viz_pub.publish(pose_map)
+
+        # 🔹 Build Nav2 goal
+        goal = NavigateToPose.Goal()
+        goal.pose = pose_map
+
+
+        self.get_logger().info("Waiting for Nav2 action server...")
+        self.nav_client.wait_for_server()
+
+        self.get_logger().info("Sending scoop goal to Nav2...")
+        self.nav_client.send_goal_async(goal)
+
 
     def publish_markers(self, center, start, end):
         ma = MarkerArray()
