@@ -1,0 +1,36 @@
+/**:
+  ros__parameters:
+    # Hardware Settings
+    serial_port: "/dev/ttyUSB0"
+    baud_rate: 921600
+    lag_offset: -2.0 # Servo lag compensation
+    
+    # Frames
+    base_frame: "base_link"
+    lidar_frame: "laser_frame"
+    
+    # Scanning Logic
+    scan_topic: "/scan"
+    accumulate_service: "save_scan" # Service name to trigger save
+
+    # Cleaning
+    voxel_size: 0.001
+    outlier_neighbors: 20
+    outlier_std_ratio: 2.0
+    
+    # Ground Removal
+    ground_threshold: 0.02
+    
+    # ROI (Region of Interest)
+    roi_x_min: 0.0
+    roi_x_max: -3.0
+    roi_y_min: -0.6
+    roi_y_max: 0.6
+    roi_z_min: -0.01
+    roi_z_max: 10.0
+
+    # Scoop / Wiper Logic
+    wiper_min_angle: 100.0
+    wiper_max_angle: 250.0
+    scoop_visual_topic: "/scoop_path_marker"
+    nav_goal_topic: "/goal_pose"
