@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # Hardware Settings
-    serial_port: "/dev/ttyUSB0"
+    serial_port: "/dev/ttyUSB1"
     baud_rate: 921600
     lag_offset: -2.0 # Servo lag compensation
     

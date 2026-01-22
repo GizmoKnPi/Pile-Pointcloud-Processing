@@ -159,73 +159,105 @@ class SmartWiper(Node):
     def find_scoop_path(self, pcd):
         points = np.asarray(pcd.points)
         
-        # 1. Median Center (The "Heart" of the pile)
-        center = np.median(points, axis=0)
+        # 1. Pivot Center
+        pivot_center = np.median(points, axis=0)
         
         min_angle = self.get_parameter('wiper_min_angle').value
         max_angle = self.get_parameter('wiper_max_angle').value
         
-        best_angle = 0
-        max_length = 0
-        
-        # We will store the vector (direction) of the best path, not just the point
+        # SCORE TRACKING
+        best_combined_score = -1.0
         best_dir_vec = np.array([1.0, 0.0, 0.0]) 
+        best_max_proj = 0.0
+        best_min_proj = 0.0
+        best_point_count = 0  # Just for logging
+        best_length = 0       # Just for logging
+        
+        # Pre-calculate 2D data
+        points_xy = points[:, :2] 
+        center_xy = pivot_center[:2]
         
         steps = int(max_angle - min_angle)
         angles = np.linspace(min_angle, max_angle, steps)
         
-        # 2. Sweep to find the "Longest Axis" (Shape of the pile)
+        # --- SWEEP ---
         for angle_deg in angles:
             angle_rad = np.deg2rad(angle_deg)
-            dir_vec = np.array([np.cos(angle_rad), np.sin(angle_rad), 0])
+            dir_xy = np.array([np.cos(angle_rad), np.sin(angle_rad)])
             
-            vec_from_center = points - center
-            projections = np.dot(vec_from_center, dir_vec)
-            dist_sq = np.sum(vec_from_center**2, axis=1) - projections**2
-            valid_mask = dist_sq < (0.05 ** 2) 
+            vec_xy = points_xy - center_xy
+            projections = np.dot(vec_xy, dir_xy)
+            dist_sq_xy = np.sum(vec_xy**2, axis=1) - projections**2
             
-            if np.sum(valid_mask) > 5:
-                current_length = np.max(projections[valid_mask])
-                if current_length > max_length:
-                    max_length = current_length
-                    best_angle = angle_deg
-                    best_dir_vec = dir_vec
+            # Width Check
+            valid_mask = dist_sq_xy < (0.05 ** 2) 
+            
+            count = np.sum(valid_mask)
+            
+            if count > 5:
+                # Calculate Length
+                valid_projections = projections[valid_mask]
+                curr_min = np.min(valid_projections)
+                curr_max = np.max(valid_projections)
+                length = curr_max - curr_min
+                
+                # --- THE WIN-WIN FORMULA ---
+                # Score = Length * Mass
+                # This rewards paths that are BOTH long AND dense.
+                score = length * count
+                
+                if score > best_combined_score:
+                    best_combined_score = score
+                    best_dir_vec = np.array([dir_xy[0], dir_xy[1], 0.0])
+                    best_min_proj = curr_min
+                    best_max_proj = curr_max
+                    # Save stats for the log report
+                    best_point_count = count
+                    best_length = length
 
-        # 3. INTELLIGENT FLIP (The Fix)
-        # We have the axis, but we don't know if it points "Front-to-Back" or "Back-to-Front".
-        # We calculate both possible start points (Front Edge and Back Edge).
+        # --- DENSITY PEAK (Blue Ball) ---
+        final_dir_xy = best_dir_vec[:2]
+        vec_xy = points_xy - center_xy
+        projections = np.dot(vec_xy, final_dir_xy)
+        dist_sq_xy = np.sum(vec_xy**2, axis=1) - projections**2
         
-        edge_a = center + best_dir_vec * max_length
-        edge_b = center - best_dir_vec * max_length
+        valid_mask = dist_sq_xy < (0.05 ** 2)
+        valid_projections = projections[valid_mask]
         
-        # Robot is always at (0,0,0) in 'base_link'
-        dist_a = np.linalg.norm(edge_a) # Distance from Robot to Edge A
-        dist_b = np.linalg.norm(edge_b) # Distance from Robot to Edge B
+        if len(valid_projections) > 0:
+            bins = np.arange(best_min_proj, best_max_proj, 0.05) 
+            if len(bins) < 2: bins = 2
+            hist, bin_edges = np.histogram(valid_projections, bins=bins)
+            max_bin_idx = np.argmax(hist)
+            peak_proj = (bin_edges[max_bin_idx] + bin_edges[max_bin_idx+1]) / 2.0
+            final_center = pivot_center + best_dir_vec * peak_proj
+        else:
+            final_center = pivot_center
+
+        # --- FLIP ---
+        edge_a = pivot_center + best_dir_vec * best_max_proj
+        edge_b = pivot_center + best_dir_vec * best_min_proj
         
-        # Pick the point closest to the robot as the "Start"
-        if dist_a < dist_b:
+        if np.linalg.norm(edge_a) < np.linalg.norm(edge_b):
             start_pt = edge_a
         else:
             start_pt = edge_b
-            
-        # End Point is always the Center (we scoop INTO the pile)
-        end_pt = center
+        end_pt = final_center
 
-        # --- NEW: PRINT THE ANGLE ---
-        # Calculate the final approach angle based on the decided Start->End direction
+        # Log Result
         dx = end_pt[0] - start_pt[0]
         dy = end_pt[1] - start_pt[1]
-        final_approach_deg = np.degrees(np.arctan2(dy, dx))
+        deg = np.degrees(np.arctan2(dy, dx))
         
         self.get_logger().info(f"--------------------------------------------------")
-        self.get_logger().info(f"PILE DETECTED:")
-        self.get_logger().info(f"   - Axis Alignment: {best_angle:.2f}° (Geometric)")
-        self.get_logger().info(f"   - Approach Angle: {final_approach_deg:.2f}° (Robot Frame)")
-        self.get_logger().info(f"   - Pile Length:    {max_length:.3f} m")
+        self.get_logger().info(f"PILE DETECTED (Hybrid Score: Length x Mass):")
+        self.get_logger().info(f"   - Approach Angle: {deg:.2f}°")
+        self.get_logger().info(f"   - Length:         {best_length:.3f} m")
+        self.get_logger().info(f"   - Points (Mass):  {best_point_count}")
+        self.get_logger().info(f"   - Winning Score:  {best_combined_score:.1f}")
         self.get_logger().info(f"--------------------------------------------------")
-        # ----------------------------
 
-        return center, start_pt, end_pt
+        return final_center, start_pt, end_pt
 
     def publish_nav_goal(self, start, end):
         msg = PoseStamped()

@@ -2,6 +2,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch.substitutions import Command
 
 def generate_launch_description():
     
@@ -9,12 +10,16 @@ def generate_launch_description():
     # This finds the installed directory regardless of where your workspace is
     pkg_share = get_package_share_directory('my_bot')
     
-    urdf_file = os.path.join(pkg_share, 'urdf', 'lidar_bot.urdf')
+    pkg_share = get_package_share_directory('mybot_2wd')
+    urdf_file = os.path.join(pkg_share, 'description', 'robot.urdf.xacro')
+    robot_desc = Command(['xacro ', urdf_file])
     config_file = os.path.join(pkg_share, 'config', 'lidar_config.yaml')
 
+    parameters=[{'robot_description': robot_desc}]
+
     # Read the URDF file
-    with open(urdf_file, 'r') as infp:
-        robot_desc = infp.read()
+    # with open(urdf_file, 'r') as infp:
+    #     robot_desc = infp.read()
 
     return LaunchDescription([
         # 1. Robot State Publisher
@@ -50,11 +55,11 @@ def generate_launch_description():
             parameters=[config_file]
         ),
         
-        # 5. RViz2 (Optional)
-        Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            # arguments=['-d', os.path.join(pkg_share, 'config', 'my_rviz_config.rviz')] # Uncomment if you save a config
-        )
+        # # 5. RViz2 (Optional)
+        # Node(
+        #     package='rviz2',
+        #     executable='rviz2',
+        #     name='rviz2',
+        #     # arguments=['-d', os.path.join(pkg_share, 'config', 'my_rviz_config.rviz')] # Uncomment if you save a config
+        # )
     ])

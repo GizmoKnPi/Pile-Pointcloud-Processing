@@ -9,7 +9,7 @@ class ServoDriver(Node):
     def __init__(self):
         super().__init__('servo_driver')
         self.declare_parameters(namespace='', parameters=[
-            ('serial_port', '/dev/ttyUSB0'),
+            ('serial_port', '/dev/ttyUSB1'),
             ('baud_rate', 921600),
             ('lag_offset', -2.0)
         ])
