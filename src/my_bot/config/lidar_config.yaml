@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # Hardware Settings
-    serial_port: "/dev/ttyUSB1"
+    serial_port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
     baud_rate: 921600
     lag_offset: -2.0 # Servo lag compensation
     
@@ -12,6 +12,9 @@
     # Scanning Logic
     scan_topic: "/scan"
     accumulate_service: "save_scan" # Service name to trigger save
+
+    buffer_duration: 60.0 # Seconds to accumulate scans
+    standoff_distance: 0.35 
 
     # Cleaning
     voxel_size: 0.001
