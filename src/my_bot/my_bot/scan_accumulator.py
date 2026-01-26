@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan, PointCloud2
+from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Trigger
 import tf2_ros
 from tf2_sensor_msgs.tf2_sensor_msgs import do_transform_cloud
@@ -9,12 +9,19 @@ import laser_geometry.laser_geometry as lg
 import sensor_msgs_py.point_cloud2 as pc2
 import open3d as o3d
 import numpy as np
+from collections import deque
 
 class ScanAccumulator(Node):
     def __init__(self):
         super().__init__('scan_accumulator')
         
-        self.accumulated_points = []
+        # --- PARAMETERS ---
+        self.declare_parameter('buffer_duration', 10.0) # Keep last 10 seconds of data
+        
+        # We use a DEQUE (Double Ended Queue) for efficient "Sliding Window"
+        # Format: [ (timestamp, [points...]), (timestamp, [points...]) ]
+        self.scan_buffer = deque()
+        
         self.is_scanning = True
         self.lp = lg.LaserProjection()
         
@@ -24,7 +31,8 @@ class ScanAccumulator(Node):
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_service(Trigger, 'save_scan_cloud', self.save_cb)
 
-        self.get_logger().info("Accumulator Ready.")
+        duration = self.get_parameter('buffer_duration').value
+        self.get_logger().info(f"Accumulator Ready. Buffer Window: {duration} seconds")
 
     def scan_cb(self, msg):
         if not self.is_scanning: return
@@ -38,55 +46,66 @@ class ScanAccumulator(Node):
                 rclpy.time.Duration(seconds=0.1)
             )
             
-            # 2. Project & Transform
+            # 2. Convert & Transform
             cloud_laser = self.lp.projectLaser(msg)
             cloud_base = do_transform_cloud(cloud_laser, trans)
             
-            # 3. FIX: Explicitly extract X, Y, Z as standard floats
-            # skip_nans=True is important!
+            # 3. Extract Points
             gen = pc2.read_points(cloud_base, field_names=("x", "y", "z"), skip_nans=True)
-            
-            # Convert the generator to a standard list of lists [[x,y,z], [x,y,z]]
-            # This fixes the "numpy.void" error
             batch = [[p[0], p[1], p[2]] for p in gen]
             
             if batch:
-                self.accumulated_points.extend(batch)
+                # 4. Add to Buffer with TIMESTAMP
+                current_time = self.get_clock().now().nanoseconds
+                self.scan_buffer.append((current_time, batch))
+                
+                # 5. PRUNE OLD DATA (The Sliding Window Logic)
+                # Convert seconds to nanoseconds (1 sec = 1e9 ns)
+                max_age_ns = self.get_parameter('buffer_duration').value * 1e9
+                
+                # While the oldest packet is too old, throw it away
+                while self.scan_buffer:
+                    oldest_time, _ = self.scan_buffer[0]
+                    if (current_time - oldest_time) > max_age_ns:
+                        self.scan_buffer.popleft() # Remove from left (Oldest)
+                    else:
+                        break # Oldest is fresh enough, stop checking
 
         except Exception:
             pass
 
     def save_cb(self, request, response):
-        self.is_scanning = False
-        num_points = len(self.accumulated_points)
-        self.get_logger().info(f"Stopping scan. Processing {num_points} points...")
+        # Flatten the buffer into a single list of points
+        all_points = []
+        for _, batch in self.scan_buffer:
+            all_points.extend(batch)
+            
+        num_points = len(all_points)
+        self.get_logger().info(f"Processing snapshot of last {self.get_parameter('buffer_duration').value}s. Points: {num_points}")
         
         if num_points == 0:
             response.success = False
-            response.message = "No points accumulated!"
+            response.message = "Buffer is empty!"
             return response
 
-        # 4. Create Open3D Cloud
         try:
             pcd = o3d.geometry.PointCloud()
-            # Now this works because accumulated_points is a simple list of floats
-            pcd.points = o3d.utility.Vector3dVector(np.array(self.accumulated_points, dtype=np.float64))
+            pcd.points = o3d.utility.Vector3dVector(np.array(all_points, dtype=np.float64))
             
             save_path = "/tmp/raw_scan.pcd"
             o3d.io.write_point_cloud(save_path, pcd)
             
             response.success = True
-            response.message = f"Saved {num_points} pts to {save_path}"
-            self.get_logger().info(f"SUCCESS: Saved to {save_path}")
+            response.message = f"Saved {num_points} pts"
+            self.get_logger().info(f"Saved to {save_path}")
             
         except Exception as e:
-            self.get_logger().error(f"Failed to save: {e}")
+            self.get_logger().error(f"Save failed: {e}")
             response.success = False
             response.message = str(e)
         
-        # Reset
-        self.accumulated_points = []
-        self.is_scanning = True
+        # Note: We do NOT clear the buffer here.
+        # This allows you to save again instantly without waiting 10s to fill up again.
         return response
 
 def main():

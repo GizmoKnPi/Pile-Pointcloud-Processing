@@ -33,7 +33,8 @@ class SmartWiper(Node):
             ('wiper_max_angle', 250.0),
             # NEW: Wall Removal Params
             ('wall_check_enable', True),
-            ('wall_distance_threshold', 0.05) # 5cm tolerance for flatness
+            ('wall_distance_threshold', 0.05), # 5cm tolerance for flatness
+            ('standoff_distance', 0.35)
         ])
 
         self.get_logger().info("=== Loaded Configuration ===")
@@ -275,47 +276,78 @@ class SmartWiper(Node):
 
 
     def send_nav_goal(self, start, end):
-        # Compute yaw
+        # --- 1. Calculate Vector Direction ---
         dx = end[0] - start[0]
         dy = end[1] - start[1]
+        
+        # --- 2. Apply Standoff (Safety Offset) ---
+        # Normalize vector length to 1.0
+        length = math.sqrt(dx*dx + dy*dy)
+        
+        if length > 0:
+            dir_x = dx / length
+            dir_y = dy / length
+            
+            # Get the safety distance from parameters
+            standoff = self.get_parameter('standoff_distance').value
+            
+            # Move the goal BACKWARDS from the pile edge
+            safe_x = start[0] - (dir_x * standoff)
+            safe_y = start[1] - (dir_y * standoff)
+            
+            self.get_logger().info(f"Applying Standoff: Stopping {standoff}m before pile.")
+        else:
+            # Fallback if length is zero (rare)
+            safe_x = start[0]
+            safe_y = start[1]
+
+        # Calculate Yaw (Face the pile)
         yaw = math.atan2(dy, dx)
 
-        # Pose in base_link
+        # --- 3. Build Pose (Base Link Frame) ---
         pose = PoseStamped()
         pose.header.frame_id = "base_link"
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = start[0]
-        pose.pose.position.y = start[1]
+        pose.pose.position.x = safe_x  # <--- Using Safe Coordinate
+        pose.pose.position.y = safe_y  # <--- Using Safe Coordinate
         pose.pose.position.z = 0.0
+        
         q = self.quaternion_from_yaw(yaw)
         pose.pose.orientation.x = q[0]
         pose.pose.orientation.y = q[1]
         pose.pose.orientation.z = q[2]
         pose.pose.orientation.w = q[3]
 
-        # Transform to map frame
-        # 🔹 Transform to map frame
-        tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
-
-        pose_in_map = do_transform_pose(pose.pose, tf)
+        # --- 4. Transform to Map Frame (for Nav2) ---
+        try:
+            # Wait briefly for the transform to be available
+            # We use a timeout to prevent crashing if TF isn't ready immediately
+            if self.tf_buffer.can_transform("map", "base_link", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)):
+                tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
+                pose_in_map = do_transform_pose(pose.pose, tf)
+            else:
+                self.get_logger().error("Transform map->base_link not available!")
+                return
+        except Exception as e:
+            self.get_logger().error(f"TF Error: {e}")
+            return
 
         pose_map = PoseStamped()
         pose_map.header.stamp = self.get_clock().now().to_msg()
         pose_map.header.frame_id = "map"
         pose_map.pose = pose_in_map
 
-        # 🔹 RViz-only visualization
+        # RViz Visualization
         self.goal_viz_pub.publish(pose_map)
 
-        # 🔹 Build Nav2 goal
+        # --- 5. Send to Nav2 ---
         goal = NavigateToPose.Goal()
         goal.pose = pose_map
-
 
         self.get_logger().info("Waiting for Nav2 action server...")
         self.nav_client.wait_for_server()
 
-        self.get_logger().info("Sending scoop goal to Nav2...")
+        self.get_logger().info(f"Sending Safe Goal: x={safe_x:.2f}, y={safe_y:.2f}")
         self.nav_client.send_goal_async(goal)
 
 
