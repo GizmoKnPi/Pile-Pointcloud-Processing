@@ -26,7 +26,7 @@ class SmartWiper(Node):
             ('voxel_size', 0.01),
             ('roi_x_min', 0.0), ('roi_x_max', 3.0),
             ('roi_y_min', -1.0), ('roi_y_max', 1.0),
-            ('roi_z_min', -0.5), ('roi_z_max', 1.5),
+            ('roi_z_min', -0.2), ('roi_z_max', 1.5),
             ('outlier_neighbors', 20),
             ('outlier_std_ratio', 2.0),
             ('wiper_min_angle', 110.0),
