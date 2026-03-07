@@ -10,6 +10,7 @@ from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_pose
+from std_srvs.srv import Trigger, SetBool
 
 import sensor_msgs_py.point_cloud2 as pc2
 import open3d as o3d
@@ -44,6 +45,17 @@ class SmartWiper(Node):
         self.get_logger().info(f"ROI Z: {self.get_parameter('roi_z_min').value} to {self.get_parameter('roi_z_max').value}")
         self.get_logger().info(f"Wiper Angles: {self.get_parameter('wiper_min_angle').value} to {self.get_parameter('wiper_max_angle').value}")
         self.get_logger().info("============================")
+
+        # Client to talk to the servo driver
+        self.servo_client = self.create_client(SetBool, 'toggle_servo_mode')
+
+        # Client to reset scan buffer
+        self.reset_client = self.create_client(Trigger, 'reset_scan_buffer')
+
+        
+        # NEW Service to manually start the rocking
+        self.create_service(Trigger, 'start_rocking', self.start_rocking_cb)
+
 
         #Nav2 services
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -96,6 +108,12 @@ class SmartWiper(Node):
         # 4. PUBLISH MARKERS
         self.publish_markers(center, start, end)
         self.send_nav_goal(start, end)
+        
+        # --- NEW: STOP THE SERVO ROCKING ---
+        if self.servo_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Process complete. Sending 'p' to stop servo.")
+            self.servo_client.call_async(SetBool.Request(data=False))
+        # -----------------------------------
         
         res.success = True
         res.message = "Path Calculated & Cleaned Cloud Published!"
@@ -377,6 +395,43 @@ class SmartWiper(Node):
         ma.markers.append(s)
         self.marker_pub.publish(ma)
 
+    def start_rocking_cb(self, req, res):
+
+        self.get_logger().info("Starting new scan cycle")
+
+        # -------- RESET SCAN BUFFER --------
+        if self.reset_client.wait_for_service(timeout_sec=1.0):
+
+            reset_req = Trigger.Request()
+            future = self.reset_client.call_async(reset_req)
+
+            rclpy.spin_until_future_complete(self, future)
+
+            if future.result().success:
+                self.get_logger().info("Scan buffer reset")
+            else:
+                self.get_logger().warn("Buffer reset failed")
+
+        else:
+            self.get_logger().warn("reset_scan_buffer service not available")
+
+        # -------- START ROCKING SERVO --------
+        if self.servo_client.wait_for_service(timeout_sec=1.0):
+
+            self.servo_client.call_async(SetBool.Request(data=True))
+
+            self.get_logger().info("Servo rocking started")
+
+            res.success = True
+            res.message = "Servo rocking started"
+
+        else:
+            res.success = False
+            res.message = "Servo driver service not available"
+            self.get_logger().error(res.message)
+
+        return res
+    
     def quaternion_from_yaw(self, yaw):
         return [0.0, 0.0, math.sin(yaw/2), math.cos(yaw/2)]
 

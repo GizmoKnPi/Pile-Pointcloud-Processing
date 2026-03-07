@@ -2,6 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_srvs.srv import SetBool
 import serial
 import math
 
@@ -13,6 +14,8 @@ class ServoDriver(Node):
             ('baud_rate', 921600),
             ('lag_offset', -2.0)
         ])
+
+        self.create_service(SetBool, 'toggle_servo_mode', self.mode_cb)
         
         # Publisher for URDF Update
         self.pub = self.create_publisher(JointState, '/joint_states', 10)
@@ -62,6 +65,14 @@ class ServoDriver(Node):
 
             except ValueError:
                 pass
+    def mode_cb(self, request, response):
+        if self.ser and self.ser.is_open:
+            if request.data:
+                self.ser.write(b's') # True = Start Rocking
+            else:
+                self.ser.write(b'p') # False = Pause/Steady
+            response.success = True
+        return response
 
 def main():
     rclpy.init()
