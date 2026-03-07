@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import PoseStamped, Point
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float32 # 🚀 IMPORTED Float32
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_pose
-from std_srvs.srv import Trigger, SetBool
 
 import sensor_msgs_py.point_cloud2 as pc2
 import open3d as o3d
@@ -25,53 +24,50 @@ class SmartWiper(Node):
         # --- 1. Parameters ---
         self.declare_parameters(namespace='', parameters=[
             ('voxel_size', 0.01),
-            ('roi_x_min', 0.0), ('roi_x_max', 3.0),
+            ('roi_x_min', 0.4), ('roi_x_max', 2.0),
             ('roi_y_min', -1.0), ('roi_y_max', 1.0),
-            ('roi_z_min', -0.2), ('roi_z_max', 1.5),
+            ('roi_z_min', -0.025), ('roi_z_max', 1.5),
             ('outlier_neighbors', 20),
             ('outlier_std_ratio', 2.0),
             ('wiper_min_angle', 110.0),
             ('wiper_max_angle', 250.0),
-            # NEW: Wall Removal Params
             ('wall_check_enable', True),
-            ('wall_distance_threshold', 0.05), # 5cm tolerance for flatness
-            ('standoff_distance', 0.35)
+            ('wall_distance_threshold', 0.05), 
+            ('standoff_distance', 0.35),
+            # 🚀 NEW: Pile measurement parameters
+            ('pile_height_threshold', -0.025), # 10cm above ground
+            ('bucket_width', 0.45),           # Physical width of the scoop
+            ('bucket_depth_max', 4)        # Max distance to drive into pile
         ])
 
         self.get_logger().info("=== Loaded Configuration ===")
         self.get_logger().info(f"Voxel Size: {self.get_parameter('voxel_size').value}")
-        self.get_logger().info(f"ROI X: {self.get_parameter('roi_x_min').value} to {self.get_parameter('roi_x_max').value}")
-        self.get_logger().info(f"ROI Y: {self.get_parameter('roi_y_min').value} to {self.get_parameter('roi_y_max').value}")
         self.get_logger().info(f"ROI Z: {self.get_parameter('roi_z_min').value} to {self.get_parameter('roi_z_max').value}")
-        self.get_logger().info(f"Wiper Angles: {self.get_parameter('wiper_min_angle').value} to {self.get_parameter('wiper_max_angle').value}")
+        self.get_logger().info(f"Bucket Specs: {self.get_parameter('bucket_width').value}m wide, {self.get_parameter('bucket_depth_max').value}m max depth")
         self.get_logger().info("============================")
 
-        # Client to talk to the servo driver
+        # Clients
         self.servo_client = self.create_client(SetBool, 'toggle_servo_mode')
-
-        # Client to reset scan buffer
         self.reset_client = self.create_client(Trigger, 'reset_scan_buffer')
 
-        
-        # NEW Service to manually start the rocking
+        # Services
         self.create_service(Trigger, 'start_rocking', self.start_rocking_cb)
+        self.create_service(Trigger, 'process_scan', self.process_cb)
 
-
-        #Nav2 services
+        # Nav2 services
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        #Rviz Visualizer
-        self.goal_viz_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
-
-        
-        # --- 3. Publishers & Services ---
+        # Publishers
         self.marker_pub = self.create_publisher(MarkerArray, '/scoop_markers', 10)
         self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
+        self.goal_viz_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
         self.pcd_pub = self.create_publisher(PointCloud2, '/cleaned_cloud', 10)
         
-        self.create_service(Trigger, 'process_scan', self.process_cb)
+        # 🚀 NEW: Publish the final calculated drive-in depth for the BT
+        self.depth_pub = self.create_publisher(Float32, '/scoop_depth', 10)
+        
         self.get_logger().info("Smart Wiper Ready. Waiting for trigger...")
 
     def process_cb(self, req, res):
@@ -86,67 +82,56 @@ class SmartWiper(Node):
         pcd = o3d.io.read_point_cloud(input_path)
         
         if len(pcd.points) == 0:
-            res.success = False
-            res.message = "Cloud is empty."
+            res.success = False; res.message = "Cloud is empty."
             return res
 
-        # 1. CLEAN (Includes Wall Removal)
+        # 1. CLEAN
         pcd = self.clean_cloud(pcd)
         self.get_logger().info(f"Points after cleaning: {len(pcd.points)}")
 
         if len(pcd.points) < 10:
-            res.success = False
-            res.message = "Too few points after cleaning."
+            res.success = False; res.message = "Too few points after cleaning."
             return res
         
         # 2. PUBLISH CLEANED CLOUD
         self.publish_open3d_cloud(pcd)
 
-        # 3. ANALYZE
-        center, start, end = self.find_scoop_path(pcd)
+        # 3. ANALYZE (🚀 NEW: Now unpacking visible_depth)
+        center, start, end, visible_depth = self.find_scoop_path(pcd)
         
-        # 4. PUBLISH MARKERS
-        self.publish_markers(center, start, end)
+        # 🚀 NEW: Publish the depth for the Behavior Tree
+        depth_msg = Float32()
+        depth_msg.data = float(visible_depth)
+        self.depth_pub.publish(depth_msg)
+
+        # 4. PUBLISH MARKERS & NAV GOAL
+        bucket_w = self.get_parameter('bucket_width').value
+        self.publish_markers(center, start, end, visible_depth, bucket_w)
         self.send_nav_goal(start, end)
         
-        # --- NEW: STOP THE SERVO ROCKING ---
+        # STOP THE SERVO ROCKING
         if self.servo_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("Process complete. Sending 'p' to stop servo.")
             self.servo_client.call_async(SetBool.Request(data=False))
-        # -----------------------------------
         
         res.success = True
         res.message = "Path Calculated & Cleaned Cloud Published!"
         return res
 
     def clean_cloud(self, pcd):
-        # A. Remove NaNs
         pcd = pcd.remove_non_finite_points()
-        
-        # B. Voxel Downsample
         voxel = self.get_parameter('voxel_size').value
         pcd = pcd.voxel_down_sample(voxel)
         
-        # C. ROI Crop
         bbox = o3d.geometry.AxisAlignedBoundingBox(
-            min_bound=(
-                self.get_parameter('roi_x_min').value, 
-                self.get_parameter('roi_y_min').value, 
-                self.get_parameter('roi_z_min').value
-            ), 
-            max_bound=(
-                self.get_parameter('roi_x_max').value, 
-                self.get_parameter('roi_y_max').value, 
-                self.get_parameter('roi_z_max').value
-            ) 
+            min_bound=(self.get_parameter('roi_x_min').value, self.get_parameter('roi_y_min').value, self.get_parameter('roi_z_min').value), 
+            max_bound=(self.get_parameter('roi_x_max').value, self.get_parameter('roi_y_max').value, self.get_parameter('roi_z_max').value) 
         )
         pcd = pcd.crop(bbox)
         
-        # D. Wall Removal (RANSAC) - NEW LOGIC
         if self.get_parameter('wall_check_enable').value and len(pcd.points) > 50:
             pcd = self.remove_walls(pcd)
         
-        # E. Outlier Removal (Clean up dust)
         nb = self.get_parameter('outlier_neighbors').value
         std = self.get_parameter('outlier_std_ratio').value
         if len(pcd.points) > nb:
@@ -156,29 +141,11 @@ class SmartWiper(Node):
 
     def remove_walls(self, pcd):
         thresh = self.get_parameter('wall_distance_threshold').value
-        
-        # Segment the largest plane in the cloud
-        plane_model, inliers = pcd.segment_plane(distance_threshold=thresh,
-                                                 ransac_n=3,
-                                                 num_iterations=1000)
-        
-        # Plane Equation: ax + by + cz + d = 0
-        # Normal Vector: [a, b, c]
+        plane_model, inliers = pcd.segment_plane(distance_threshold=thresh, ransac_n=3, num_iterations=1000)
         [a, b, c, d] = plane_model
-        
-        # Check if Vertical:
-        # If the plane is a wall, the Normal is horizontal (X or Y aligned).
-        # Therefore, 'c' (the Z component) should be small (close to 0).
-        # If 'c' is large (close to 1), it's a floor/ceiling.
-        
         if abs(c) < 0.2: 
-            # It IS a vertical wall (Normal is horizontal)
             self.get_logger().info(f"Vertical Wall Detected (Normal Z={c:.2f}). Removing {len(inliers)} points.")
-            # Invert=True keeps everything EXCEPT the wall
             pcd = pcd.select_by_index(inliers, invert=True)
-        else:
-            self.get_logger().info(f"Largest plane is NOT a wall (Normal Z={c:.2f}). Keeping it.")
-            
         return pcd
 
     def publish_open3d_cloud(self, pcd):
@@ -191,29 +158,24 @@ class SmartWiper(Node):
 
     def find_scoop_path(self, pcd):
         points = np.asarray(pcd.points)
-        
-        # 1. Pivot Center
         pivot_center = np.median(points, axis=0)
         
         min_angle = self.get_parameter('wiper_min_angle').value
         max_angle = self.get_parameter('wiper_max_angle').value
         
-        # SCORE TRACKING
         best_combined_score = -1.0
         best_dir_vec = np.array([1.0, 0.0, 0.0]) 
         best_max_proj = 0.0
         best_min_proj = 0.0
-        best_point_count = 0  # Just for logging
-        best_length = 0       # Just for logging
+        best_point_count = 0 
+        best_length = 0       
         
-        # Pre-calculate 2D data
         points_xy = points[:, :2] 
         center_xy = pivot_center[:2]
         
         steps = int(max_angle - min_angle)
         angles = np.linspace(min_angle, max_angle, steps)
         
-        # --- SWEEP ---
         for angle_deg in angles:
             angle_rad = np.deg2rad(angle_deg)
             dir_xy = np.array([np.cos(angle_rad), np.sin(angle_rad)])
@@ -222,21 +184,14 @@ class SmartWiper(Node):
             projections = np.dot(vec_xy, dir_xy)
             dist_sq_xy = np.sum(vec_xy**2, axis=1) - projections**2
             
-            # Width Check
             valid_mask = dist_sq_xy < (0.05 ** 2) 
-            
             count = np.sum(valid_mask)
             
             if count > 5:
-                # Calculate Length
                 valid_projections = projections[valid_mask]
                 curr_min = np.min(valid_projections)
                 curr_max = np.max(valid_projections)
                 length = curr_max - curr_min
-                
-                # --- THE WIN-WIN FORMULA ---
-                # Score = Length * Mass
-                # This rewards paths that are BOTH long AND dense.
                 score = length * count
                 
                 if score > best_combined_score:
@@ -244,11 +199,9 @@ class SmartWiper(Node):
                     best_dir_vec = np.array([dir_xy[0], dir_xy[1], 0.0])
                     best_min_proj = curr_min
                     best_max_proj = curr_max
-                    # Save stats for the log report
                     best_point_count = count
                     best_length = length
 
-        # --- DENSITY PEAK (Blue Ball) ---
         final_dir_xy = best_dir_vec[:2]
         vec_xy = points_xy - center_xy
         projections = np.dot(vec_xy, final_dir_xy)
@@ -267,7 +220,6 @@ class SmartWiper(Node):
         else:
             final_center = pivot_center
 
-        # --- FLIP ---
         edge_a = pivot_center + best_dir_vec * best_max_proj
         edge_b = pivot_center + best_dir_vec * best_min_proj
         
@@ -277,57 +229,78 @@ class SmartWiper(Node):
             start_pt = edge_b
         end_pt = final_center
 
-        # Log Result
+        # ---------------------------------------------------------
+        # 🚀 NEW: MEASURE VISIBLE PILE DEPTH (Fixed Vector Direction)
+        # ---------------------------------------------------------
+        z_thresh = self.get_parameter('pile_height_threshold').value
+        bucket_width = self.get_parameter('bucket_width').value
+        
+        z_mask = points[:, 2] > z_thresh
+        width_mask = dist_sq_xy < ((bucket_width / 2.0) ** 2)
+        valid_pile_mask = z_mask & width_mask
+        
+        # 1. Calculate the explicit "drive-in" vector (start -> end)
+        dx_drive = end_pt[0] - start_pt[0]
+        dy_drive = end_pt[1] - start_pt[1]
+        drive_len = math.sqrt(dx_drive*dx_drive + dy_drive*dy_drive)
+        
+        if drive_len > 0:
+            explicit_drive_dir = np.array([dx_drive / drive_len, dy_drive / drive_len])
+        else:
+            explicit_drive_dir = np.array([1.0, 0.0]) # Fallback
+
+        if np.any(valid_pile_mask):
+            valid_pile_points = points_xy[valid_pile_mask]
+            vec_from_start = valid_pile_points - start_pt[:2]
+            
+            # 2. Project onto our guaranteed inward-pointing vector
+            projections_from_start = np.dot(vec_from_start, explicit_drive_dir)
+            raw_depth = np.max(projections_from_start)
+        else:
+            raw_depth = 0.0
+            self.get_logger().warn("No points found above Z-threshold in the scoop path!")
+
+        # 3. Double Clamp: Never greater than bucket max, NEVER less than 0.0
+        max_allowed = self.get_parameter('bucket_depth_max').value
+        visible_depth = max(0.0, min(raw_depth, max_allowed))
+
+        # ---------------------------------------------------------
+
         dx = end_pt[0] - start_pt[0]
         dy = end_pt[1] - start_pt[1]
         deg = np.degrees(np.arctan2(dy, dx))
         
         self.get_logger().info(f"--------------------------------------------------")
-        self.get_logger().info(f"PILE DETECTED (Hybrid Score: Length x Mass):")
+        self.get_logger().info(f"PILE DETECTED:")
         self.get_logger().info(f"   - Approach Angle: {deg:.2f}°")
-        self.get_logger().info(f"   - Length:         {best_length:.3f} m")
-        self.get_logger().info(f"   - Points (Mass):  {best_point_count}")
-        self.get_logger().info(f"   - Winning Score:  {best_combined_score:.1f}")
+        self.get_logger().info(f"   - Raw Pile Depth: {raw_depth:.3f} m")
+        self.get_logger().info(f"   - Clamped Scoop:  {visible_depth:.3f} m  <-- Driving this far")
         self.get_logger().info(f"--------------------------------------------------")
 
-        return final_center, start_pt, end_pt
-
+        # 🚀 NEW: Returning visible_depth to pass to the publisher
+        return final_center, start_pt, end_pt, visible_depth
 
     def send_nav_goal(self, start, end):
-        # --- 1. Calculate Vector Direction ---
         dx = end[0] - start[0]
         dy = end[1] - start[1]
-        
-        # --- 2. Apply Standoff (Safety Offset) ---
-        # Normalize vector length to 1.0
         length = math.sqrt(dx*dx + dy*dy)
         
         if length > 0:
             dir_x = dx / length
             dir_y = dy / length
-            
-            # Get the safety distance from parameters
             standoff = self.get_parameter('standoff_distance').value
-            
-            # Move the goal BACKWARDS from the pile edge
             safe_x = start[0] - (dir_x * standoff)
             safe_y = start[1] - (dir_y * standoff)
-            
-            self.get_logger().info(f"Applying Standoff: Stopping {standoff}m before pile.")
         else:
-            # Fallback if length is zero (rare)
             safe_x = start[0]
             safe_y = start[1]
 
-        # Calculate Yaw (Face the pile)
         yaw = math.atan2(dy, dx)
-
-        # --- 3. Build Pose (Base Link Frame) ---
         pose = PoseStamped()
         pose.header.frame_id = "base_link"
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = safe_x  # <--- Using Safe Coordinate
-        pose.pose.position.y = safe_y  # <--- Using Safe Coordinate
+        pose.pose.position.x = safe_x  
+        pose.pose.position.y = safe_y  
         pose.pose.position.z = 0.0
         
         q = self.quaternion_from_yaw(yaw)
@@ -336,10 +309,7 @@ class SmartWiper(Node):
         pose.pose.orientation.z = q[2]
         pose.pose.orientation.w = q[3]
 
-        # --- 4. Transform to Map Frame (for Nav2) ---
         try:
-            # Wait briefly for the transform to be available
-            # We use a timeout to prevent crashing if TF isn't ready immediately
             if self.tf_buffer.can_transform("map", "base_link", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)):
                 tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
                 pose_in_map = do_transform_pose(pose.pose, tf)
@@ -355,44 +325,78 @@ class SmartWiper(Node):
         pose_map.header.frame_id = "map"
         pose_map.pose = pose_in_map
 
-        # RViz Visualization
         self.goal_viz_pub.publish(pose_map)
 
-        # --- 5. Send to Nav2 ---
         goal = NavigateToPose.Goal()
         goal.pose = pose_map
 
         self.get_logger().info("Waiting for Nav2 action server...")
         self.nav_client.wait_for_server()
-
-        self.get_logger().info(f"Sending Safe Goal: x={safe_x:.2f}, y={safe_y:.2f}")
         self.nav_client.send_goal_async(goal)
 
-
-    def publish_markers(self, center, start, end):
+    # 🚀 NEW: Signature updated to accept visible_depth and bucket_width
+    def publish_markers(self, center, start, end, visible_depth, bucket_width):
         ma = MarkerArray()
+        
+        # 1. The Line (Arrow)
         m = Marker()
         m.header.frame_id = "base_link"
         m.type = Marker.ARROW
         m.action = Marker.ADD
         m.id = 0
-        m.points = [Point(x=start[0], y=start[1], z=start[2]), 
-                    Point(x=end[0], y=end[1], z=end[2])]
-        m.scale.x = 0.05 
-        m.scale.y = 0.1 
+        m.points = [Point(x=start[0], y=start[1], z=start[2]), Point(x=end[0], y=end[1], z=end[2])]
+        m.scale.x = 0.05; m.scale.y = 0.1 
         m.color.r = 1.0; m.color.a = 1.0
         ma.markers.append(m)
+        
+        # 2. The Target (Sphere)
         s = Marker()
         s.header.frame_id = "base_link"
         s.type = Marker.SPHERE
         s.action = Marker.ADD
         s.id = 1
-        s.pose.position.x = center[0]
-        s.pose.position.y = center[1]
-        s.pose.position.z = center[2]
+        s.pose.position.x = center[0]; s.pose.position.y = center[1]; s.pose.position.z = center[2]
         s.scale.x = 0.1; s.scale.y = 0.1; s.scale.z = 0.1
         s.color.b = 1.0; s.color.a = 1.0
         ma.markers.append(s)
+
+        # ---------------------------------------------------------
+        # 🚀 NEW: THE SCOOP VOLUME (Green Transparent Cube)
+        # ---------------------------------------------------------
+        c = Marker()
+        c.header.frame_id = "base_link"
+        c.type = Marker.CUBE
+        c.action = Marker.ADD
+        c.id = 2
+        
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.sqrt(dx*dx + dy*dy)
+        
+        if length > 0:
+            dir_x = dx / length
+            dir_y = dy / length
+        else:
+            dir_x = 1.0; dir_y = 0.0
+
+        c.pose.position.x = start[0] + (dir_x * (visible_depth / 2.0))
+        c.pose.position.y = start[1] + (dir_y * (visible_depth / 2.0))
+        c.pose.position.z = 0.1 # Float it slightly off the ground
+        
+        yaw = math.atan2(dy, dx)
+        q = self.quaternion_from_yaw(yaw)
+        c.pose.orientation.x = q[0]; c.pose.orientation.y = q[1]; c.pose.orientation.z = q[2]; c.pose.orientation.w = q[3]
+        
+        c.scale.x = float(visible_depth)   # Depth of the bite
+        c.scale.y = float(bucket_width)    # Width of your bucket
+        c.scale.z = 0.2                    # Arbitrary height for visual effect
+        
+        c.color.r = 0.0; c.color.g = 1.0; c.color.b = 0.0
+        c.color.a = 0.4 # Semi-transparent
+        
+        ma.markers.append(c)
+        # ---------------------------------------------------------
+
         self.marker_pub.publish(ma)
 
     def start_rocking_cb(self, req, res):
@@ -401,31 +405,26 @@ class SmartWiper(Node):
 
         # -------- RESET SCAN BUFFER --------
         if self.reset_client.wait_for_service(timeout_sec=1.0):
-
             reset_req = Trigger.Request()
-            future = self.reset_client.call_async(reset_req)
-
-            rclpy.spin_until_future_complete(self, future)
-
-            if future.result().success:
-                self.get_logger().info("Scan buffer reset")
-            else:
-                self.get_logger().warn("Buffer reset failed")
-
+            
+            # 🚀 FIX: Removed the spin_until_future_complete deadlock!
+            # We just fire the request asynchronously and keep moving.
+            self.reset_client.call_async(reset_req)
+            self.get_logger().info("Scan buffer reset requested")
+            
         else:
             self.get_logger().warn("reset_scan_buffer service not available")
 
         # -------- START ROCKING SERVO --------
         if self.servo_client.wait_for_service(timeout_sec=1.0):
-
             self.servo_client.call_async(SetBool.Request(data=True))
-
+            
             self.get_logger().info("Servo rocking started")
-
             res.success = True
             res.message = "Servo rocking started"
-
+            
         else:
+            # 🚀 FIX: Restored your safety fallback so you know if it fails
             res.success = False
             res.message = "Servo driver service not available"
             self.get_logger().error(res.message)
@@ -439,3 +438,6 @@ def main():
     rclpy.init()
     rclpy.spin(SmartWiper())
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
