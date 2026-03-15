@@ -24,18 +24,18 @@ class SmartWiper(Node):
         # --- 1. Parameters ---
         self.declare_parameters(namespace='', parameters=[
             ('voxel_size', 0.01),
-            ('roi_x_min', 0.4), ('roi_x_max', 2.0),
+            ('roi_x_min', 0.8), ('roi_x_max', 2.0),
             ('roi_y_min', -1.0), ('roi_y_max', 1.0),
-            ('roi_z_min', -0.025), ('roi_z_max', 1.5),
+            ('roi_z_min', 0.01), ('roi_z_max', 1.5),
             ('outlier_neighbors', 20),
             ('outlier_std_ratio', 2.0),
             ('wiper_min_angle', 110.0),
             ('wiper_max_angle', 250.0),
             ('wall_check_enable', True),
-            ('wall_distance_threshold', 0.05), 
-            ('standoff_distance', 0.35),
+            ('wall_distance_threshold', 0.005), 
+            ('standoff_distance', 0.75),
             # 🚀 NEW: Pile measurement parameters
-            ('pile_height_threshold', -0.025), # 10cm above ground
+            ('pile_height_threshold', 0.01), # 10cm above ground
             ('bucket_width', 0.45),           # Physical width of the scoop
             ('bucket_depth_max', 4)        # Max distance to drive into pile
         ])
