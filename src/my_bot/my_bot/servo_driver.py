@@ -26,6 +26,12 @@ class ServoDriver(Node):
         # Bucket state publisher
         self.bucket_pub = self.create_publisher(String, '/bucket_position', 10)
 
+        # Bucket state publisher
+        self.bucket_pub = self.create_publisher(String, '/bucket_position', 10)
+
+        # 🚀 ADD THIS: Listen for commands from the Behavior Tree
+        self.cmd_sub = self.create_subscription(String, '/bucket_command', self.command_cb, 10)
+
         port = self.get_parameter('serial_port').value
         baud = self.get_parameter('baud_rate').value
         self.lag_offset = self.get_parameter('lag_offset').value
@@ -106,6 +112,14 @@ class ServoDriver(Node):
             response.success = True
 
         return response
+    
+    def command_cb(self, msg):
+        # 🚀 ADD THIS: Write the incoming ROS string directly to the ESP32
+        if hasattr(self, 'ser') and self.ser.is_open:
+            # msg.data contains 'R', 'B', or 'N'. 
+            # .encode() safely converts the string into bytes (e.g., b'R')
+            self.ser.write(msg.data.encode())
+            self.get_logger().info(f"Sent command to ESP32: {msg.data}")
 
 
 def main():
